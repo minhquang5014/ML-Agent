@@ -3,3 +3,7 @@ MiniLm-L6/
 outputs/
 processed/
 bin/
+xtts_env/
+xTTS/
+STT-model/
+optimized-opt-2.7B-8bit/
