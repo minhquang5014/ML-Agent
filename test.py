@@ -113,6 +113,9 @@ def record_audio(file_path):
     print("Recording Stopped.")
 
 def chatgpt_streamed():
+    # what this function does here is that it compares "sentence embeddings" of the user input with the vault (memory),
+    # deciding which embeddings to store, and then decode it to text that is readable by humans 
+    # and then pass it to an LLM model -> generate human-like responses
     pass
 
 def get_relevant_context(user_input, vault_embeddings, vault_content, model, top_k=3):
