@@ -1,182 +1,277 @@
-from transformers import AutoTokenizer, AutoModel
+import sys
+import os
 import torch
 import torch.nn.functional as f
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    TextIteratorStreamer
+)
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from accelerate import init_empty_weights, infer_auto_device_map
-from sentence_transformers import SentenceTransformer, util 
-import os
+from sentence_transformers import SentenceTransformer, util
+import threading
 
-def get_relevant_context(user_input, vault_embeddings, vault_content, model, top_k=3):
-    """Retrieves the top-k most relevant context from the vault based on the user input."""
-    if vault_embeddings.nelement() == 0: # Check if the tensor has any elements
+@dataclass
+class GenLLMConfig:
+    max_new_tokens: int = 160
+    do_sample: bool = False              # greedy by default for speed/stability
+    # temperature: float = 0.7
+    # top_k: int = 50
+    # top_p: float = 0.95
+    repetition_penalty: float = 1.3
+
+@dataclass
+class RAGConfig:
+    top_k: int = 4
+    max_history_turns: int = 8
+
+MODEL_NAME = "facebook/opt-2.7B"
+CACHE_DIR = "./optimized-opt-2.7B-8bit"
+LOCAL_DIR = (
+    "./optimized-opt-2.7B-8bit/models--facebook--opt-2.7B/"
+    "snapshots/905a4b602cda5c501f1b3a2650a4152680238254"
+)
+
+CHATBOT_NAME = "Sarah"
+CHATBOT_DIR = "temp-memory/chatbot2.txt"
+VAULT_PATH = "temp-memory/vault.txt"
+
+
+def read_file(path: str, default: str = "") -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as read:
+            return read.read()
+    except FileNotFoundError:
+        return default
+
+def read_lines(path: str) -> List[str]:
+    if not os.path.exists(path):
         return []
-    # Encode the user input
-    input_embedding = model.encode([user_input])
-    # Compute cosine similarity between the input and vault embeddings 
-    cos_scores = util.cos_sim(input_embedding, vault_embeddings)[0] # Adjust top_k if it's greater than the number of available scores 
-    top_k = min (top_k, len(cos_scores))
-    # Sort the scores and get the top-k indices
-    top_indices = torch.topk(cos_scores, k=top_k)[1].tolist()
-    # Get the corresponding context from the vault
-    relevant_context = [vault_content[idx].strip() for idx in top_indices]
-    return relevant_context
+    with open(path, "r", encoding="utf-8") as read_lines:
+        return [ln.rstrip("\n") for ln in read_lines.readlines() if ln.strip()]
 
-class LLM_Model:
-    def __init__(self, model_name, cache_dir, local_dir):
-        self.model_name = model_name
-        self.cache_dir = cache_dir
+def append_lines(path: str, text:str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text.rstrip("\n") + "\n")
+
+class Retriever:
+    def __init__(self, device: str = None):
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Put embedder on GPU when available
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+        self.vault_texts: List[str] = []
+        self.vault_embs: torch.Tensor = torch.empty(0)
+
+    def load_vault(self, path: str) -> None:
+        self.vault_texts = read_lines(path)
+        if len(self.vault_texts) == 0:
+            self.vault_embs = torch.empty(0)
+            return
+        # encode directly to tensor for speed; keep on embedder device
+        self.vault_embs = self.embedder.encode(
+            self.vault_texts,
+            convert_to_tensor=True,
+            show_progress_bar=False,
+        )
+
+    def add_to_vault(self, path: str, text: str) -> None:
+        append_lines(path, text)
+        self.vault_texts.append(text)
+        new_emb = self.embedder.encode([text], convert_to_tensor=True, show_progress_bar=False)
+        if self.vault_embs.nelement() == 0:
+            self.vault_embs = new_emb
+        else:
+            self.vault_embs = torch.cat([self.vault_embs, new_emb], dim=0)
+
+    def get_relevant(self, query: str, top_k: int = 3) -> List[str]:
+        if self.vault_embs is None or self.vault_embs.nelement() == 0:
+            return []
+        q_emb = self.embedder.encode([query], convert_to_tensor=True, show_progress_bar=False)
+        scores = util.cos_sim(q_emb, self.vault_embs)[0]  # shape: [N]
+        k = min(top_k, scores.shape[0])
+        top_idx = torch.topk(scores, k=k).indices.tolist()
+        return [self.vault_texts[i].strip() for i in top_idx]
+
+# =====================
+# LLM Wrapper
+# =====================
+
+class LLMModel:
+    def __init__(self, local_dir: str, cache_dir: str = None):
         self.local_dir = local_dir
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.pretrained_model_and_tokenizer()
-    def pretrained_model_and_tokenizer(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir)
-        # # Initialize model with empty weights to manage device map efficiently
-        with init_empty_weights():
-            self.model = AutoModelForCausalLM.from_pretrained(self.local_dir)
-            # tie the model weights to prevent memory overhead
-            self.model.tie_weights()
-
-        # Infer device map to manage model layers between GPU and CPU
-        device_map = infer_auto_device_map(self.model, max_memory={0: "4GiB", "cpu": "6GiB"})
-        # configure quantization using BitsAndBytesConfig
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-        )
-
-        # Load the model with 8-bit quantization and mixed precision
+        self.cache_dir = cache_dir
+        # 8-bit quantized load (single pass)
+        bnb_cfg = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(local_dir)
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.local_dir,
-            device_map='auto',
-            quantization_config=quantization_config,
-            offload_folder="./offload",
+            local_dir,
+            device_map="auto",
+            quantization_config=bnb_cfg,
+            offload_folder=os.path.join(cache_dir or ".", "offload"),
             torch_dtype=torch.float16,
-            offload_state_dict=True
+        )
+        # Helps reduce memory during training; harmless during inference
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            try:
+                self.model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
+    @torch.inference_mode()
+    def generate(self, prompt: str, gen_cfg: GenLLMConfig, stream: bool = False):
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        # Move inputs to the same device as the first weight shard
+        device = list(self.model.hf_device_map.keys())[0] if hasattr(self.model, "hf_device_map") else "cuda" if torch.cuda.is_available() else "cpu"
+        inputs = {k: v.to(self.model.device if hasattr(self.model, "device") else device) for k, v in inputs.items()}
+
+        gen_kwargs = dict(
+            max_new_tokens=gen_cfg.max_new_tokens,
+            do_sample=gen_cfg.do_sample,
+            temperature=gen_cfg.temperature,
+            top_k=gen_cfg.top_k,
+            top_p=gen_cfg.top_p,
+            repetition_penalty=gen_cfg.repetition_penalty,
+            pad_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
         )
 
-        self.model.gradient_checkpointing_enable()
+        if stream:
+            streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+            gen_kwargs["streamer"] = streamer
+            thread = threading.Thread(target=self.model.generate, kwargs={**inputs, **gen_kwargs})
+            thread.start()
+            return streamer  # caller will iterate
+        else:
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+            return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    def generate_text(self, prompt, max_length=500):
-        # Move inputs to the appropriate device (CPU or GPU)
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+# =====================
+# Prompting
+# =====================
 
-        # Generate text using the optimized model
-        with torch.no_grad():
-            outputs = self.model.generate(
-                inputs.input_ids,
-                max_length=max_length,
-                do_sample=True,
-                top_k=50,
-                top_p=0.95,
-                temperature=0.7
-            )
-        # Decode the outputs and return the generated text
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-model_name = "facebook/opt-2.7B"
-cache_dir = "./optimized-opt-2.7B-8bit"
-local_dir = "./optimized-opt-2.7B-8bit/models--facebook--opt-2.7B/snapshots/905a4b602cda5c501f1b3a2650a4152680238254"
-# prompt = "Once upon a time"
-llm_model = LLM_Model(model_name=model_name, cache_dir=cache_dir, local_dir=local_dir)
-# generated_text = llm_model.generate_text(prompt)
-# print(generated_text)
+PROMPT_TEMPLATE = (
+    "{system}\n\n"
+    "Relevant information from the knowledge vault:\n{context}\n\n"
+    "Conversation so far:\n{history}\n\n"
+    "User: {user}\n{bot}:"
+)
 
 
-
-def chatgpt_streamed(user_input, system_message, conversation_history, chatbot_name, vault_embeddings, vault_content,
-                     embed_model, top_k = 3):
-    """
-    user_input: str
-    system_message: str (system instructions, role prompt)
-    conversation_history: list of dicts [{"role": "user"/"assistant", "content": str}]
-    chatbot_name: str
-    vault_embeddings: torch.Tensor of stored embeddings
-    vault_content: list of str
-    embed_model: SentenceTransformer instance
-    """
-    relevant_context = get_relevant_context(user_input, vault_embeddings, vault_content, embed_model, top_k)
-    history_text = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in conversation_history])
-    context_text = "\n".join(relevant_context)
-    full_prompt = (
-        f"{system_message}\n\n"
-        f"Relevant information from the knowledge vault:\n{context_text}\n\n"
-        f"Conversation so far:\n{history_text}\n\n"
-        f"User: {user_input}\n{chatbot_name}:"
+def build_prompt(
+    system_message: str,
+    user_input: str,
+    history: List[Dict[str, str]],
+    relevant_context: List[str],
+    bot_name: str,
+    rag_cfg: RAGConfig,
+) -> str:
+    # keep only last N turns
+    if len(history) > rag_cfg.max_history_turns:
+        history = history[-rag_cfg.max_history_turns :]
+    history_text = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in history])
+    context_text = "\n".join(relevant_context) if relevant_context else "(none)"
+    return PROMPT_TEMPLATE.format(
+        system=system_message.strip(),
+        context=context_text.strip(),
+        history=history_text.strip(),
+        user=user_input.strip(),
+        bot=bot_name,
     )
-    generated_text = llm_model.generate_text(full_prompt)
-    if chatbot_name in generated_text:
-        output = generated_text.split(f"{chatbot_name}:")[-1].strip()
-    return output
 
+# =====================
+# Chat Loop
+# =====================
 
-def open_file(filepath):
-    with open(filepath, 'r', encoding='utf-8') as infile:
-        return infile.read()
-PINK = '\033[95m'
-CYAN = '\033[96m' 
-YELLOW = '\033[93m'
-NEON_GREEN = '\033[92m'
-RESET_COLOR = '\033[0m'
-chatbot_dir = 'temp-memory/chatbot2.txt'
-vault_dir = 'temp-memory/vault.txt'
-def user_chatbot_conversation():
-    conversation_history = []
-    system_message = open_file(chatbot_dir)
-    sentence_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    # Create embeddings for the initial vault content
-    vault_content = []
-    if os.path.exists(vault_dir):
-        with open(vault_dir, "r", encoding="utf-8") as vault_file:
-            vault_content = vault_file.readlines()
-    vault_embeddings = sentence_embedding_model.encode(vault_content) if vault_content else []
-    vault_embeddings_tensor = torch.tensor(vault_embeddings)
+def chat_loop():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Load components
+    retriever = Retriever(device=device)
+    retriever.load_vault(VAULT_PATH)
+
+    llm = LLMModel(local_dir=LOCAL_DIR, cache_dir=CACHE_DIR)
+
+    system_message = read_file(CHATBOT_DIR, default=(
+        "You are a helpful assistant. Keep answers concise unless more detail is requested."
+    ))
+
+    gen_cfg = GenLLMConfig()
+    rag_cfg = RAGConfig()
+
+    history: List[Dict[str, str]] = []
+
+    print("Type 'exit' to quit. Commands: 'print info', 'delete info', 'insert info: <text>'\n")
+
     while True:
-        user_input = input("Input here: ").strip()
-        # Clean up the temporary audio file
-        if user_input.lower() == "exit": # Say 'exit' to end the conversation break
+        try:
+            user_input = input("Input here: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
             break
-        elif user_input.lower().startswith(("print info", "Print info")): # Print the contents of the vault.txt file 
-            print("Info contents:")
-            if os.path.exists(vault_dir):
-                with open(vault_dir, "r", encoding="utf-8") as vault_file: 
-                    print(vault_file.read())
-            else:
-                print("Info is empty.")
-            continue
-        elif user_input.lower().startswith(("delete info", "Delete info")): 
-            confirm = input("Are you sure? Say 'Yes' to confirm: ")
-            if confirm.lower() == "yes":
-                if os.path.exists(vault_dir):
-                    os.remove(vault_dir)
-                    print("Info deleted.") 
-                    vault_content= []
-                    vault_embeddings = []
-                    vault_embeddings_tensor = torch.tensor(vault_embeddings)
-                else:
-                    print("Info is already empty.")
-            else:
-                print("Info deletion cancelled.")
-            continue
-        elif user_input.lower().startswith(("insert info", "insert info")): 
-            with open(vault_dir, "a", encoding="utf-8") as vault_file: 
-                vault_file.write(user_input + "\n")
-            print("Wrote to info.")
-            # Update the vault content and embeddings
-            vault_content = open(vault_dir, "r", encoding="utf-8").readlines()
-            vault_embeddings = sentence_embedding_model.encode(vault_content)
-            vault_embeddings_tensor = torch.tensor(vault_embeddings)
-            continue
-        print(CYAN + "You: ", user_input + RESET_COLOR)
-        conversation_history.append({"role": "user", "content": user_input})
 
-        print(PINK + "Sarah: "+ RESET_COLOR)
-        chatbot_response = chatgpt_streamed(user_input, system_message, conversation_history, "Sarah", vault_embeddings_tensor, vault_content, sentence_embedding_model) 
-        conversation_history.append({"role": "assistant", "content": chatbot_response}) 
-        # prompt2 = chatbot_response
-        # audio_file_pth2 = "C:/Users/kris_/Python/fsts2/XTTS-v2/samples/emma2.wav"
-        # process_and_play(prompt2, audio_file_pth2)
-        if len(conversation_history) > 20:
-            conversation_history = conversation_history[-20:]
-        print(conversation_history, chatbot_response)
+        if not user_input:
+            continue
 
-user_chatbot_conversation() # Start the conversation
+        low = user_input.lower()
+        if low == "exit":
+            print("Goodbye!")
+            break
+
+        # Commands
+        if low.startswith("print info"):
+            print("\n--- Info contents ---")
+            print(read_file(VAULT_PATH, default="(empty)"))
+            print("---------------------\n")
+            continue
+
+        if low.startswith("delete info"):
+            confirm = input("Are you sure? Type 'yes' to confirm: ").strip().lower()
+            if confirm == "yes":
+                if os.path.exists(VAULT_PATH):
+                    os.remove(VAULT_PATH)
+                retriever.load_vault(VAULT_PATH)
+                print("Info deleted.\n")
+            else:
+                print("Cancelled.\n")
+            continue
+
+        if low.startswith("insert info"):
+            # formats accepted: "insert info: <text>" or ask interactively if missing
+            parts = user_input.split(":", 1)
+            if len(parts) == 2 and parts[1].strip():
+                info_text = parts[1].strip()
+            else:
+                info_text = input("Enter info text to insert: ").strip()
+            if info_text:
+                retriever.add_to_vault(VAULT_PATH, info_text)
+                print("Wrote to info.\n")
+            else:
+                print("Nothing added.\n")
+            continue
+
+        # RAG retrieval
+        relevant = retriever.get_relevant(user_input, top_k=rag_cfg.top_k)
+        prompt = build_prompt(system_message, user_input, history, relevant, CHATBOT_NAME, rag_cfg)
+
+        # Streamed generation for responsiveness
+        print(f"\n{CHATBOT_NAME}: ", end="", flush=True)
+        streamer = llm.generate(prompt, gen_cfg, stream=True)
+        collected = []
+        for token in streamer:
+            sys.stdout.write(token)
+            sys.stdout.flush()
+            collected.append(token)
+        print("\n")
+        reply_text = "".join(collected).strip()
+
+        # Update history (truncate to last N kept by builder anyway)
+        history.append({"role": "user", "content": user_input})
+        history.append({"role": "assistant", "content": reply_text})
+
+
+if __name__ == "__main__":
+    chat_loop()
