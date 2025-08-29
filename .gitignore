@@ -9,3 +9,5 @@ STT-model/
 optimized-opt-2.7B-8bit/
 offload/
 temp-memory/
+LLM_model/
+output.wav/

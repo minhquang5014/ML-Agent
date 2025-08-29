@@ -8,3 +8,11 @@ The beautiful assistance Sarah responded with an anwser: Why don't you try the l
 
 And Sarah pops up youtube video on the screen without the users even navigating around the browser, around Ytb to find interesting videos.
 
+
+Workflow
+SST: Whisper model, or Distil-whisper
+Sentence Embedding: all-MiniLM-L6-v2
+For LLM: mistral 7B model in gguf format - this is running on top of the llama-cpp module - currently running test successfully
+TTS: OpenVoice module but it requires complex setup and download
+or we can use xTTS-v2 or gTTS or parlerTTS
+KittenTTS is also, but it runs on CPU, maybe requires C++ extension installation
